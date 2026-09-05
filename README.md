@@ -45,7 +45,7 @@ Then open `http://localhost:8080/` in a browser.
 |-------------------|-----------------------------------------------------------------|
 | `index.html`      | UI layout and styling                                          |
 | `chirp-codec.js`  | Core DSP: Baudot encoding, CRC32, chirp modulation/demodulation, FFT, sync correlation |
-| `app.js`          | Wires the UI to the codec: live readout, WAV encode/playback/download, WAV decode with auto-detection |
+| `app.js`          | Wires the UI to the codec: live readout, WAV encode/playback/download, header-first WAV decode |
 | `test_codec.js`   | Node.js unit tests for the codec (run with `node test_codec.js`) |
 | `test_integration.js` | Node.js end-to-end tests mirroring the app's actual encode/decode logic (run with `node test_integration.js`) |
 
@@ -63,11 +63,14 @@ speaker output), not a measured or guaranteed number. Real outdoor
 conditions — wind, other noise sources, mic placement, speaker volume —
 vary considerably. Treat it as a starting point to test from, not a promise.
 
-## Auto-detect decoding
+## Self-describing header
 
-If you don't know (or didn't record) the exact settings used to encode a
-message, toggle off "I know the encoding settings used" before decoding.
-The decoder will try a set of candidate data rates, pick the one with the
-strongest sync-chirp correlation, then try error-correction levels from
-none up to maximum — favoring whichever combination makes the CRC32
-checksum (if one was included) validate.
+Every transmission opens with a short header — always sent at a fixed 5 bps
+regardless of the payload's own rate — that tells the decoder exactly what
+data rate, error-correction level, checksum setting, and repeat count
+follow. This means decoding never requires knowing or entering the
+sender's settings in advance: just record the audio and decode it. The
+header is 23 bits (9 for rate, 8 for error-correction percentage, 1 for the
+checksum flag, 5 for repeat count) packed into 5 chirp symbols, preceded by
+its own sync chirp so the decoder can find it regardless of where the
+recording starts.

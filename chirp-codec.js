@@ -407,9 +407,85 @@ const ChirpCodec = (() => {
     return { positions, corr };
   }
 
+  // ---------- Self-describing header ----------
+  // Every transmission starts with a fixed-rate (5 bps), fixed-format
+  // header so the receiver never needs to know or guess the payload's
+  // settings in advance. Bit layout (23 bits total, packed MSB-first into
+  // 5 Baudot-style 5-bit symbols with 2 bits of zero padding at the end):
+  //   bits  0-8  (9 bits): data rate in bps, 0-300
+  //   bits  9-16 (8 bits): error-correction percentage, 0-100
+  //   bit   17   (1 bit) : CRC32-included flag
+  //   bits  18-22 (5 bits): repeat count, 0-31
+  const HEADER_BPS = 5;
+  const HEADER_BITS = 9 + 8 + 1 + 5; // 23
+  const HEADER_SYMBOLS = Math.ceil(HEADER_BITS / 5); // 5
+
+  function packHeaderBits(bps, eccPercent, useCrc, repeats) {
+    const bits = [];
+    const pushInt = (val, nBits) => {
+      for (let i = nBits - 1; i >= 0; i--) bits.push((val >> i) & 1);
+    };
+    pushInt(Math.max(0, Math.min(511, Math.round(bps))), 9);
+    pushInt(Math.max(0, Math.min(255, Math.round(eccPercent))), 8);
+    bits.push(useCrc ? 1 : 0);
+    pushInt(Math.max(0, Math.min(31, Math.round(repeats))), 5);
+    while (bits.length < HEADER_SYMBOLS * 5) bits.push(0); // pad
+    return bits;
+  }
+
+  function bitsToSymbols(bits) {
+    const symbols = [];
+    for (let i = 0; i < bits.length; i += 5) {
+      let v = 0;
+      for (let j = 0; j < 5; j++) v = (v << 1) | (bits[i + j] || 0);
+      symbols.push(v);
+    }
+    return symbols;
+  }
+
+  function headerToSymbols(bps, eccPercent, useCrc, repeats) {
+    return bitsToSymbols(packHeaderBits(bps, eccPercent, useCrc, repeats));
+  }
+
+  function symbolsToHeaderBits(symbols) {
+    const bits = [];
+    for (const s of symbols) {
+      for (let j = 4; j >= 0; j--) bits.push((s >> j) & 1);
+    }
+    return bits;
+  }
+
+  function symbolsToHeader(symbols) {
+    const bits = symbolsToHeaderBits(symbols);
+    const readInt = (offset, nBits) => {
+      let v = 0;
+      for (let i = 0; i < nBits; i++) v = (v << 1) | (bits[offset + i] || 0);
+      return v;
+    };
+    const bps = readInt(0, 9);
+    const eccPercent = readInt(9, 8);
+    const useCrc = readInt(17, 1) === 1;
+    const repeats = readInt(18, 5);
+    return { bps, eccPercent, useCrc, repeats };
+  }
+
+  // A decoded header is only trustworthy if its fields are in sane ranges
+  // (protects against treating garbage/noise as a valid header and then
+  // trying to decode a nonsensical payload with e.g. 0 bps).
+  function isPlausibleHeader(header) {
+    if (!header) return false;
+    if (header.bps < 1 || header.bps > 300) return false;
+    if (header.eccPercent < 0 || header.eccPercent > 100) return false;
+    if (header.repeats < 1 || header.repeats > 31) return false;
+    return true;
+  }
+
   return {
     SAMPLE_RATE, F_LOW, F_HIGH, BANDWIDTH, N_SYMBOLS,
     GUARD_FRACTION, SYNC_GUARD_FRACTION,
+    HEADER_BPS, HEADER_BITS, HEADER_SYMBOLS,
+    packHeaderBits, bitsToSymbols, headerToSymbols,
+    symbolsToHeaderBits, symbolsToHeader, isPlausibleHeader,
     textToSymbols, symbolsToText,
     crc32, textToBytes, crc32ToSymbols, symbolsToCrc32,
     eccRepFactor, applyRepetition, undoRepetitionMajorityVote,

@@ -16,7 +16,7 @@ function assert(cond, msg) {
   else console.log('OK:', msg);
 }
 
-// ---- copied from app.js: buildMessageWaveform ----
+// ---- copied from app.js: buildMessageWaveform (now includes header) ----
 function buildMessageWaveform(params) {
   const { message, bps, eccPct, useCrc, repeats } = params;
   const sr = C.SAMPLE_RATE;
@@ -46,20 +46,38 @@ function buildMessageWaveform(params) {
   }
   const repeatLen = repeatParts.reduce((a, p) => a + p.length, 0);
 
-  const totalLen = repeatLen * repeats;
+  // Header: fixed 5bps, sent once at the very start
+  const headerDurSec = C.bpsToSymbolDuration(C.HEADER_BPS);
+  const headerBaseUp = C.makeRealUpChirp(headerDurSec, sr);
+  const headerBaseDown = C.makeRealDownChirp(headerDurSec, sr);
+  const headerSyncChirp = C.applyFade(headerBaseDown, sr, 5);
+  const headerGuardN = Math.round(headerDurSec * C.GUARD_FRACTION * sr);
+  const headerSyncGuardN = Math.round(headerDurSec * C.SYNC_GUARD_FRACTION * sr);
+  const headerGuard = new Float64Array(headerGuardN);
+  const headerSyncGuard = new Float64Array(headerSyncGuardN);
+  const headerSymbols = C.headerToSymbols(bps, eccPct, useCrc, repeats);
+  const headerParts = [headerSyncChirp, headerSyncGuard];
+  for (const s of headerSymbols) {
+    headerParts.push(C.applyFade(C.cyclicShift(headerBaseUp, s, C.N_SYMBOLS), sr, 5));
+    headerParts.push(headerGuard);
+  }
+  const headerLen = headerParts.reduce((a, p) => a + p.length, 0);
+
+  const totalLen = headerLen + repeatLen * repeats;
   const full = new Float64Array(totalLen);
+  let off = 0;
+  for (const p of headerParts) { full.set(p, off); off += p.length; }
   const oneRepeat = new Float64Array(repeatLen);
   let ro = 0;
   for (const p of repeatParts) { oneRepeat.set(p, ro); ro += p.length; }
-  let off = 0;
   for (let r = 0; r < repeats; r++) { full.set(oneRepeat, off); off += repeatLen; }
   for (let i = 0; i < full.length; i++) full[i] *= 0.85;
-  return { waveform: full, sr, symbolCount: symbols.length };
+  return { waveform: full, sr, symbolCount: symbols.length, headerLen };
 }
 
-// ---- copied from app.js: attemptDecode ----
-function attemptDecode(data, sr, bps, repFactor, useCrc, expectedPayloadLen) {
-  const symbolDurSec = C.bpsToSymbolDuration(bps);
+// ---- copied from app.js: decodeHeader ----
+function decodeHeader(data, sr) {
+  const symbolDurSec = C.bpsToSymbolDuration(C.HEADER_BPS);
   const baseUp = C.makeRealUpChirp(symbolDurSec, sr);
   const baseDown = C.makeRealDownChirp(symbolDurSec, sr);
   const refComplex = C.makeComplexUpChirp(symbolDurSec, sr);
@@ -72,6 +90,54 @@ function attemptDecode(data, sr, bps, repFactor, useCrc, expectedPayloadLen) {
   const step = symN + guardN;
 
   const { positions, corr } = C.findSyncPositions(data, sr, baseDown, Math.max(symbolDurSec * 0.5, 0.01), 0.35);
+  if (positions.length === 0) return { ok: false, reason: 'no-header-sync', positions, corr };
+
+  const headerSyncPos = positions[0];
+  const start = headerSyncPos + symN + syncGuardN;
+
+  const symbols = [];
+  for (let k = 0; k < C.HEADER_SYMBOLS; k++) {
+    const segStart = start + k * step;
+    const segEnd = segStart + symN;
+    if (segEnd > data.length) return { ok: false, reason: 'header-truncated', positions, corr };
+    const segment = data.subarray(segStart, segEnd);
+    const demod = C.iqDemodulate(segment, refComplex);
+    const re = new Float64Array(nPow2);
+    const im = new Float64Array(nPow2);
+    re.set(demod.re); im.set(demod.im);
+    C.fft(re, im);
+    let bestBin = validBins[0], bestMag = -1;
+    for (const b of validBins) {
+      const mag = re[b]*re[b] + im[b]*im[b];
+      if (mag > bestMag) { bestMag = mag; bestBin = b; }
+    }
+    symbols.push(binToSymbol[bestBin]);
+  }
+
+  const header = C.symbolsToHeader(symbols);
+  if (!C.isPlausibleHeader(header)) return { ok: false, reason: 'header-implausible', header, positions, corr };
+
+  const headerEndSample = start + C.HEADER_SYMBOLS * step;
+  return { ok: true, header, headerEndSample, headerSyncPos, positions, corr };
+}
+
+// ---- copied from app.js: attemptDecode (now with searchStartSample) ----
+function attemptDecode(data, sr, bps, repFactor, useCrc, expectedPayloadLen, searchStartSample) {
+  const symbolDurSec = C.bpsToSymbolDuration(bps);
+  const baseUp = C.makeRealUpChirp(symbolDurSec, sr);
+  const baseDown = C.makeRealDownChirp(symbolDurSec, sr);
+  const refComplex = C.makeComplexUpChirp(symbolDurSec, sr);
+  const { binToSymbol, nPow2 } = C.buildSymbolToBinTable(symbolDurSec, sr);
+  const validBins = Object.keys(binToSymbol).map(Number).sort((a, b) => a - b);
+
+  const symN = baseUp.length;
+  const guardN = Math.round(symbolDurSec * C.GUARD_FRACTION * sr);
+  const syncGuardN = Math.round(symbolDurSec * C.SYNC_GUARD_FRACTION * sr);
+  const step = symN + guardN;
+
+  const searchData = searchStartSample ? data.subarray(searchStartSample) : data;
+  const { positions: rawPositions, corr } = C.findSyncPositions(searchData, sr, baseDown, Math.max(symbolDurSec * 0.5, 0.01), 0.35);
+  const positions = searchStartSample ? rawPositions.map(p => p + searchStartSample) : rawPositions;
   if (positions.length === 0) return { ok: false, reason: 'no-sync', positions, corr };
 
   let nSymsPerRepeat = expectedPayloadLen != null ? (expectedPayloadLen * repFactor) : null;
@@ -150,21 +216,35 @@ function attemptDecode(data, sr, bps, repFactor, useCrc, expectedPayloadLen) {
   return { ok: true, text, avgConf, symbols: payloadSymbols, positions, corr, crcOk, validRepeats, totalRepeats: positions.length };
 }
 
-// ================= TESTS =================
+// ---- copied from app.js: full decode flow (header-first) ----
+function fullDecode(data, sr) {
+  const headerResult = decodeHeader(data, sr);
+  if (!headerResult.ok) {
+    return { ok: false, reason: headerResult.reason || 'no-header-sync' };
+  }
+  const { bps, eccPercent, useCrc, repeats } = headerResult.header;
+  const repFactor = C.eccRepFactor(eccPercent);
+  const result = attemptDecode(data, sr, bps, repFactor, useCrc, null, headerResult.headerEndSample);
+  if (result.ok) result.headerInfo = { bps, eccPercent, useCrc, repeats };
+  return result;
+}
 
-// Test A: basic round trip, no CRC, no ECC, "known settings" mode
+// ================= TESTS =================
+// Test A: basic round trip, no CRC, no ECC -- settings recovered from header
 {
   const params = { message: 'HELLOWORLD', bps: 5, eccPct: 0, useCrc: false, repeats: 3 };
   const { waveform, sr } = buildMessageWaveform(params);
-  const result = attemptDecode(waveform, sr, params.bps, 1, false, null);
+  const result = fullDecode(waveform, sr);
   assert(result.ok && result.text === 'HELLOWORLD', `basic round trip: ${JSON.stringify(result.ok ? result.text : result.reason)}`);
+  assert(result.ok && result.headerInfo && result.headerInfo.bps === 5 && result.headerInfo.eccPercent === 0 && result.headerInfo.useCrc === false && result.headerInfo.repeats === 3,
+    `header correctly recovered: ${JSON.stringify(result.headerInfo)}`);
 }
 
 // Test B: with CRC, no ECC
 {
   const params = { message: 'HELLOWORLD', bps: 5, eccPct: 0, useCrc: true, repeats: 3 };
   const { waveform, sr } = buildMessageWaveform(params);
-  const result = attemptDecode(waveform, sr, params.bps, 1, true, null);
+  const result = fullDecode(waveform, sr);
   assert(result.ok && result.text === 'HELLOWORLD' && result.crcOk === true,
     `CRC round trip: ok=${result.ok} text=${result.text} crcOk=${result.crcOk}`);
 }
@@ -173,26 +253,28 @@ function attemptDecode(data, sr, bps, repFactor, useCrc, expectedPayloadLen) {
 {
   const params = { message: 'HELLOWORLD', bps: 5, eccPct: 50, useCrc: false, repeats: 3 };
   const { waveform, sr } = buildMessageWaveform(params);
-  const repFactor = C.eccRepFactor(params.eccPct);
-  const result = attemptDecode(waveform, sr, params.bps, repFactor, false, null);
+  const result = fullDecode(waveform, sr);
   assert(result.ok && result.text === 'HELLOWORLD', `ECC round trip: ${JSON.stringify(result.ok ? result.text : result.reason)}`);
+  assert(result.ok && result.headerInfo.eccPercent === 50, `header ECC% recovered: ${result.headerInfo && result.headerInfo.eccPercent}`);
 }
 
-// Test D: CRC + ECC together
+// Test D: CRC + ECC together, non-default rate
 {
   const params = { message: 'HELLOWORLD', bps: 10, eccPct: 75, useCrc: true, repeats: 4 };
   const { waveform, sr } = buildMessageWaveform(params);
-  const repFactor = C.eccRepFactor(params.eccPct);
-  const result = attemptDecode(waveform, sr, params.bps, repFactor, true, null);
+  const result = fullDecode(waveform, sr);
   assert(result.ok && result.text === 'HELLOWORLD' && result.crcOk === true,
     `CRC+ECC round trip @ 10bps: ok=${result.ok} text=${result.text} crcOk=${result.crcOk}`);
+  assert(result.ok && result.headerInfo.bps === 10 && result.headerInfo.repeats === 4,
+    `header rate+repeats recovered: ${JSON.stringify(result.headerInfo)}`);
 }
 
-// Test E: high bps (300 - the fast end of the slider)
+// Test E: high bps (300 - the fast end of the slider) -- header itself
+// always stays at 5bps regardless, only the payload speeds up
 {
   const params = { message: 'HI', bps: 300, eccPct: 0, useCrc: true, repeats: 5 };
   const { waveform, sr } = buildMessageWaveform(params);
-  const result = attemptDecode(waveform, sr, params.bps, 1, true, null);
+  const result = fullDecode(waveform, sr);
   assert(result.ok && result.text === 'HI' && result.crcOk === true,
     `300bps round trip: ok=${result.ok} text=${result.text} crcOk=${result.crcOk}`);
 }
@@ -201,11 +283,12 @@ function attemptDecode(data, sr, bps, repFactor, useCrc, expectedPayloadLen) {
 {
   const params = { message: 'HI', bps: 1, eccPct: 0, useCrc: false, repeats: 2 };
   const { waveform, sr } = buildMessageWaveform(params);
-  const result = attemptDecode(waveform, sr, params.bps, 1, false, null);
+  const result = fullDecode(waveform, sr);
   assert(result.ok && result.text === 'HI', `1bps round trip: ok=${result.ok} text=${result.text}`);
 }
 
-// Test G: robustness with injected white noise at moderate SNR
+// Test G: robustness with injected white noise at moderate SNR (header AND
+// payload both need to survive the noise now, not just the payload)
 {
   const params = { message: 'HELLOWORLD', bps: 5, eccPct: 0, useCrc: true, repeats: 5 };
   const { waveform, sr } = buildMessageWaveform(params);
@@ -213,13 +296,12 @@ function attemptDecode(data, sr, bps, repFactor, useCrc, expectedPayloadLen) {
   const targetSnrDb = -15;
   const noiseRms = signalRms / Math.pow(10, targetSnrDb/20);
   const noisy = new Float64Array(waveform.length);
-  // simple gaussian-ish noise via sum of uniforms (Irwin-Hall approx)
   function gaussApprox() {
     let s = 0; for (let i=0;i<6;i++) s += Math.random();
     return (s - 3) / 3;
   }
   for (let i=0;i<waveform.length;i++) noisy[i] = waveform[i] + gaussApprox()*noiseRms;
-  const result = attemptDecode(noisy, sr, params.bps, 1, true, null);
+  const result = fullDecode(noisy, sr);
   assert(result.ok && result.text === 'HELLOWORLD',
     `noisy (-15dB SNR) round trip: ok=${result.ok} text=${result.ok?result.text:result.reason} crcOk=${result.crcOk}`);
 }
@@ -232,69 +314,39 @@ function attemptDecode(data, sr, bps, repFactor, useCrc, expectedPayloadLen) {
   const full = new Float64Array(leadIn.length + waveform.length);
   full.set(leadIn, 0);
   full.set(waveform, leadIn.length);
-  const result = attemptDecode(full, sr, params.bps, 1, false, null);
+  const result = fullDecode(full, sr);
   assert(result.ok && result.text === 'HELLOWORLD', `leading silence round trip: ok=${result.ok} text=${result.ok?result.text:result.reason}`);
 }
 
+// Test I: header sync is never mistaken for the payload sync (regression
+// test for the exact bug class this refactor could introduce -- searching
+// for the payload sync starting from sample 0 instead of after the header
+// could, in principle, re-detect the header's own down-chirp)
+{
+  const params = { message: 'HELLOWORLD', bps: 50, eccPct: 0, useCrc: true, repeats: 3 };
+  const { waveform, sr } = buildMessageWaveform(params);
+  const result = fullDecode(waveform, sr);
+  assert(result.ok && result.totalRepeats === 3,
+    `payload sync count excludes header sync: expected 3 repeats, got ${result.ok ? result.totalRepeats : result.reason}`);
+}
+
+// Test J: a header with an implausible/garbage decode (pure noise, no real
+// transmission) is correctly rejected rather than proceeding to decode junk
+{
+  const sr = C.SAMPLE_RATE;
+  const pureNoise = new Float64Array(sr * 10);
+  for (let i = 0; i < pureNoise.length; i++) pureNoise[i] = (Math.random() - 0.5) * 0.1;
+  const result = fullDecode(pureNoise, sr);
+  assert(result.ok === false, `pure noise correctly rejected: ok=${result.ok} reason=${result.reason}`);
+}
+
+// Test K: repeats count at the upper boundary (31, the 5-bit max)
+{
+  const params = { message: 'HI', bps: 100, eccPct: 0, useCrc: false, repeats: 31 };
+  const { waveform, sr } = buildMessageWaveform(params);
+  const result = fullDecode(waveform, sr);
+  assert(result.ok && result.text === 'HI' && result.headerInfo.repeats === 31,
+    `repeats=31 boundary: ok=${result.ok} text=${result.ok?result.text:result.reason} repeats=${result.ok?result.headerInfo.repeats:'?'}`);
+}
+
 console.log('\nDone.');
-
-// ---- copied from app.js: auto-detect logic ----
-function autoDetectDecode(data, sr) {
-  const candidates = [5, 1, 2, 10, 20, 50, 100, 150, 300];
-  let bestBps = null, bestScore = -1;
-  for (let ci = 0; ci < candidates.length; ci++) {
-    const bps = candidates[ci];
-    const symbolDurSec = C.bpsToSymbolDuration(bps);
-    const baseDown = C.makeRealDownChirp(symbolDurSec, sr);
-    const { positions, corr } = C.findSyncPositions(data, sr, baseDown, Math.max(symbolDurSec * 0.5, 0.01), 0.4);
-    if (positions.length >= 2) {
-      let peak = 0;
-      for (const p of positions) peak = Math.max(peak, corr[p] || 0);
-      const sorted = Float64Array.from(corr).sort((a,b)=>a-b);
-      const median = sorted[Math.floor(sorted.length / 2)] || 1;
-      const score = peak / Math.max(median, 1e-6);
-      if (score > bestScore) { bestScore = score; bestBps = bps; }
-    }
-  }
-  if (bestBps == null) return { ok: false, reason: 'no-sync' };
-  let found = null;
-  for (const useCrc of [true, false]) {
-    for (let rep = 1; rep <= 5; rep++) {
-      const attempt = attemptDecode(data, sr, bestBps, rep, useCrc, null);
-      if (attempt.ok && useCrc && attempt.crcOk) { found = attempt; break; }
-      if (attempt.ok && !useCrc && !found) found = attempt;
-    }
-    if (found && found.crcOk) break;
-  }
-  return found || { ok: false, reason: 'no-complete-repeats', bestBps };
-}
-
-// Test I: auto-detect with default settings (5bps, no ecc, with crc) - the
-// most common case a user would hit if they forget to note their settings.
-{
-  const params = { message: 'HELLOWORLD', bps: 5, eccPct: 0, useCrc: true, repeats: 3 };
-  const { waveform, sr } = buildMessageWaveform(params);
-  const result = autoDetectDecode(waveform, sr);
-  assert(result.ok && result.text === 'HELLOWORLD' && result.crcOk === true,
-    `auto-detect default settings: ok=${result.ok} text=${result.ok?result.text:result.reason} crcOk=${result.crcOk}`);
-}
-
-// Test J: auto-detect with a non-default rate + ECC
-{
-  const params = { message: 'HELLOWORLD', bps: 20, eccPct: 50, useCrc: true, repeats: 4 };
-  const { waveform, sr } = buildMessageWaveform(params);
-  const result = autoDetectDecode(waveform, sr);
-  assert(result.ok && result.text === 'HELLOWORLD' && result.crcOk === true,
-    `auto-detect 20bps+ecc50%: ok=${result.ok} text=${result.ok?result.text:result.reason} crcOk=${result.crcOk} bestBps=${result.bestBps}`);
-}
-
-// Test K: auto-detect with no CRC at all (should still fall back sanely)
-{
-  const params = { message: 'HELLOWORLD', bps: 5, eccPct: 0, useCrc: false, repeats: 3 };
-  const { waveform, sr } = buildMessageWaveform(params);
-  const result = autoDetectDecode(waveform, sr);
-  assert(result.ok && result.text === 'HELLOWORLD',
-    `auto-detect no-CRC fallback: ok=${result.ok} text=${result.ok?result.text:result.reason}`);
-}
-
-console.log('\nAuto-detect tests done.');

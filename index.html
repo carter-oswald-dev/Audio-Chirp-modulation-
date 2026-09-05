@@ -382,6 +382,7 @@
       <div class="label">audio duration</div>
     </div>
     <div class="readout">
+      <div class="readout-row"><span class="k">Header (auto, fixed 5 bps)</span><span class="v" id="roHeader">—</span></div>
       <div class="readout-row"><span class="k">Payload</span><span class="v" id="roPayload">—</span></div>
       <div class="readout-row"><span class="k">Checksum overhead</span><span class="v" id="roCrc">—</span></div>
       <div class="readout-row"><span class="k">Error-correction overhead</span><span class="v" id="roEcc">—</span></div>
@@ -408,35 +409,7 @@
       <div class="fname" id="fileName"></div>
     </div>
     <input type="file" id="fileInput" accept=".wav,audio/wav,audio/x-wav" style="display:none">
-
-    <div class="field" style="margin-top:16px;">
-      <div class="toggle-row">
-        <span class="desc">I know the encoding settings used (rate / ECC / CRC) — otherwise the decoder will try to auto-detect</span>
-        <label class="switch">
-          <input type="checkbox" id="knownSettingsToggle">
-          <span class="slider"></span>
-        </label>
-      </div>
-    </div>
-    <div id="decodeSettingsPanel" style="display:none;">
-      <div class="grid-2">
-        <div class="field">
-          <label>Data rate used <span class="val" id="decBpsVal">5 bps</span></label>
-          <input type="range" id="decBpsSlider" min="1" max="300" value="5" step="1">
-        </div>
-        <div class="field">
-          <label>Error correction used <span class="val" id="decEccVal">0%</span></label>
-          <input type="range" id="decEccSlider" min="0" max="100" value="0" step="5">
-        </div>
-      </div>
-      <div class="toggle-row">
-        <span class="desc">CRC32 checksum was included</span>
-        <label class="switch">
-          <input type="checkbox" id="decCrcToggle" checked>
-          <span class="slider"></span>
-        </label>
-      </div>
-    </div>
+    <div class="note">Settings (data rate, error correction, checksum) are read automatically from a short header at the start of every transmission made with this tool — no need to know or re-enter them.</div>
 
     <button class="primary" id="decodeBtn" style="margin-top:16px;" disabled>Decode</button>
     <div class="progress-wrap" id="decProgress"><div class="progress-bar" id="decProgressBar"></div></div>
@@ -452,7 +425,7 @@
   <div class="panel">
     <p class="panel-title">HOW THIS WORKS</p>
     <div class="note" style="font-size:0.83rem;">
-      Text is converted to 5-bit Baudot code, then each 5-bit symbol is encoded as a cyclically time-shifted chirp (a linear frequency sweep) — the same family of technique LoRa radios and GPS use to pull signals up out of the noise. A distinct down-sweep marks the start of each repeat so the decoder can find its place even with an arbitrary recording start time. Decoding happens entirely in your browser: nothing you upload leaves your device.<br><br>
+      Text is converted to 5-bit Baudot code, then each 5-bit symbol is encoded as a cyclically time-shifted chirp (a linear frequency sweep) — the same family of technique LoRa radios and GPS use to pull signals up out of the noise. Every transmission opens with a short header, always sent at a fixed 5 bps regardless of the payload's own rate, that tells the decoder exactly what data rate, error-correction level, checksum setting, and repeat count follow — so decoding never requires knowing or guessing the sender's settings in advance. A distinct down-sweep marks the start of the header and of each payload repeat, so the decoder can find its place even with an arbitrary recording start time. Decoding happens entirely in your browser: nothing you upload leaves your device.<br><br>
       <strong>Data rate</strong> trades speed for range: a slower symbol rate spends more time per bit, which buys more processing gain against noise. <strong>Error correction</strong> repeats each symbol multiple times and decodes by majority vote, trading transmission time for robustness against dropped or corrupted symbols. <strong>CRC32</strong> adds a short checksum so the decoder can tell you whether the recovered text is likely correct, rather than silently returning corrupted text.<br><br>
       The distance-based rate suggestion is a rough physical estimate (spreading loss + assumed ambient noise), not a guarantee — real outdoor conditions (wind, other noise sources, mic placement) vary considerably. Treat it as a starting point to test from, not a promise.
     </div>

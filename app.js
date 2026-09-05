@@ -17,6 +17,7 @@
   const distNote = document.getElementById('distNote');
 
   const durationBig = document.getElementById('durationBig');
+  const roHeader = document.getElementById('roHeader');
   const roPayload = document.getElementById('roPayload');
   const roCrc = document.getElementById('roCrc');
   const roEcc = document.getElementById('roEcc');
@@ -34,13 +35,6 @@
   const dropzone = document.getElementById('dropzone');
   const fileInput = document.getElementById('fileInput');
   const fileNameEl = document.getElementById('fileName');
-  const knownSettingsToggle = document.getElementById('knownSettingsToggle');
-  const decodeSettingsPanel = document.getElementById('decodeSettingsPanel');
-  const decBpsSlider = document.getElementById('decBpsSlider');
-  const decBpsVal = document.getElementById('decBpsVal');
-  const decEccSlider = document.getElementById('decEccSlider');
-  const decEccVal = document.getElementById('decEccVal');
-  const decCrcToggle = document.getElementById('decCrcToggle');
   const decodeBtn = document.getElementById('decodeBtn');
   const decProgress = document.getElementById('decProgress');
   const decProgressBar = document.getElementById('decProgressBar');
@@ -137,7 +131,14 @@
     const syncGuardSec = symbolDurSec * C.SYNC_GUARD_FRACTION;
 
     const perRepeatSec = syncSec + syncGuardSec + totalSymbolsPerRepeat * (symbolDurSec + guardSec);
-    const totalSec = perRepeatSec * repeats;
+
+    const headerDurSec = C.bpsToSymbolDuration(C.HEADER_BPS);
+    const headerGuardSec = headerDurSec * C.GUARD_FRACTION;
+    const headerSyncSec = headerDurSec;
+    const headerSyncGuardSec = headerDurSec * C.SYNC_GUARD_FRACTION;
+    const headerSec = headerSyncSec + headerSyncGuardSec + C.HEADER_SYMBOLS * (headerDurSec + headerGuardSec);
+
+    const totalSec = headerSec + perRepeatSec * repeats;
 
     const chirpGainDb = 10 * Math.log10(symbolDurSec * C.BANDWIDTH);
 
@@ -159,6 +160,7 @@
     roSymDur.textContent = `${(symbolDurSec * 1000).toFixed(1)} ms`;
     roBw.textContent = `${C.F_LOW / 1000}–${C.F_HIGH / 1000} kHz (${C.BANDWIDTH} Hz)`;
     roGain.textContent = `~${chirpGainDb.toFixed(1)} dB`;
+    roHeader.textContent = `${C.HEADER_SYMBOLS} symbols, ${headerSec.toFixed(2)}s`;
 
     const distM = distanceInMeters();
     if (distM) {
@@ -183,6 +185,7 @@
     const sr = C.SAMPLE_RATE;
     const symbolDurSec = C.bpsToSymbolDuration(bps);
 
+    // ---- Payload symbols (unchanged from before) ----
     let symbols = C.textToSymbols(message);
     if (useCrc) {
       const bytes = C.textToBytes(message);
@@ -207,9 +210,32 @@
     }
     const repeatLen = repeatParts.reduce((a, p) => a + p.length, 0);
 
-    const totalLen = repeatLen * repeats;
+    // ---- Header: ALWAYS at a fixed 5bps, regardless of payload rate, so
+    // the decoder can always find and read it without knowing anything in
+    // advance. Sent once, at the very start, not repeated with the payload. ----
+    const headerDurSec = C.bpsToSymbolDuration(C.HEADER_BPS);
+    const headerBaseUp = C.makeRealUpChirp(headerDurSec, sr);
+    const headerBaseDown = C.makeRealDownChirp(headerDurSec, sr);
+    const headerSyncChirp = C.applyFade(headerBaseDown, sr, 5);
+    const headerGuardN = Math.round(headerDurSec * C.GUARD_FRACTION * sr);
+    const headerSyncGuardN = Math.round(headerDurSec * C.SYNC_GUARD_FRACTION * sr);
+    const headerGuard = new Float64Array(headerGuardN);
+    const headerSyncGuard = new Float64Array(headerSyncGuardN);
+
+    const headerSymbols = C.headerToSymbols(bps, eccPct, useCrc, repeats);
+    const headerParts = [headerSyncChirp, headerSyncGuard];
+    for (const s of headerSymbols) {
+      headerParts.push(C.applyFade(C.cyclicShift(headerBaseUp, s, C.N_SYMBOLS), sr, 5));
+      headerParts.push(headerGuard);
+    }
+    const headerLen = headerParts.reduce((a, p) => a + p.length, 0);
+
+    // ---- Assemble: header once, then payload repeated `repeats` times ----
+    const totalLen = headerLen + repeatLen * repeats;
     const full = new Float64Array(totalLen);
     let off = 0;
+    for (const p of headerParts) { full.set(p, off); off += p.length; }
+
     const oneRepeat = new Float64Array(repeatLen);
     let ro = 0;
     for (const p of repeatParts) { oneRepeat.set(p, ro); ro += p.length; }
@@ -222,7 +248,7 @@
     // amplitude headroom
     for (let i = 0; i < full.length; i++) full[i] *= 0.85;
 
-    return { waveform: full, sr, symbolCount: symbols.length };
+    return { waveform: full, sr, symbolCount: symbols.length, headerLen };
   }
 
   function floatToWavBlob(waveform, sr) {
@@ -315,12 +341,6 @@
   downloadBtn.addEventListener('click', downloadWav);
 
   // ---------- Decode ----------
-  knownSettingsToggle.addEventListener('change', () => {
-    decodeSettingsPanel.style.display = knownSettingsToggle.checked ? 'block' : 'none';
-  });
-  decBpsSlider.addEventListener('input', () => { decBpsVal.textContent = `${decBpsSlider.value} bps`; });
-  decEccSlider.addEventListener('input', () => { decEccVal.textContent = `${decEccSlider.value}%`; });
-
   dropzone.addEventListener('click', () => fileInput.click());
   dropzone.addEventListener('dragover', (e) => { e.preventDefault(); dropzone.classList.add('drag'); });
   dropzone.addEventListener('dragleave', () => dropzone.classList.remove('drag'));
@@ -377,8 +397,13 @@
 
   // Attempt decode at one specific (bps, repFactor) setting. Returns
   // { text, confidenceAvg, symbols, positions, corr, crcOk, crcChecked }
-  function attemptDecode(data, sr, bps, repFactor, useCrc, expectedPayloadLen) {
-    const symbolDurSec = C.bpsToSymbolDuration(bps);
+  // Decode the fixed-rate (5bps) self-describing header at the start of a
+  // transmission. Always uses C.HEADER_BPS regardless of the payload's
+  // rate, so this never requires guessing anything. Returns
+  // { ok, header, headerEndSample, positions, corr } — headerEndSample is
+  // where the payload's own sync chirp should begin.
+  function decodeHeader(data, sr) {
+    const symbolDurSec = C.bpsToSymbolDuration(C.HEADER_BPS);
     const baseUp = C.makeRealUpChirp(symbolDurSec, sr);
     const baseDown = C.makeRealDownChirp(symbolDurSec, sr);
     const refComplex = C.makeComplexUpChirp(symbolDurSec, sr);
@@ -391,6 +416,64 @@
     const step = symN + guardN;
 
     const { positions, corr } = C.findSyncPositions(data, sr, baseDown, Math.max(symbolDurSec * 0.5, 0.01), 0.35);
+    if (positions.length === 0) {
+      return { ok: false, reason: 'no-header-sync', positions, corr };
+    }
+
+    // The header is only ever sent ONCE, at the very start of the file —
+    // use the earliest detected sync as the header's position.
+    const headerSyncPos = positions[0];
+    const start = headerSyncPos + symN + syncGuardN;
+
+    const symbols = [];
+    for (let k = 0; k < C.HEADER_SYMBOLS; k++) {
+      const segStart = start + k * step;
+      const segEnd = segStart + symN;
+      if (segEnd > data.length) {
+        return { ok: false, reason: 'header-truncated', positions, corr };
+      }
+      const segment = data.subarray(segStart, segEnd);
+      const demod = C.iqDemodulate(segment, refComplex);
+      const re = new Float64Array(nPow2);
+      const im = new Float64Array(nPow2);
+      re.set(demod.re); im.set(demod.im);
+      C.fft(re, im);
+      let bestBin = validBins[0], bestMag = -1;
+      for (const b of validBins) {
+        const mag = re[b]*re[b] + im[b]*im[b];
+        if (mag > bestMag) { bestMag = mag; bestBin = b; }
+      }
+      symbols.push(binToSymbol[bestBin]);
+    }
+
+    const header = C.symbolsToHeader(symbols);
+    if (!C.isPlausibleHeader(header)) {
+      return { ok: false, reason: 'header-implausible', header, positions, corr };
+    }
+
+    const headerEndSample = start + C.HEADER_SYMBOLS * step;
+    return { ok: true, header, headerEndSample, headerSyncPos, positions, corr };
+  }
+
+  function attemptDecode(data, sr, bps, repFactor, useCrc, expectedPayloadLen, searchStartSample) {
+    const symbolDurSec = C.bpsToSymbolDuration(bps);
+    const baseUp = C.makeRealUpChirp(symbolDurSec, sr);
+    const baseDown = C.makeRealDownChirp(symbolDurSec, sr);
+    const refComplex = C.makeComplexUpChirp(symbolDurSec, sr);
+    const { binToSymbol, nPow2 } = C.buildSymbolToBinTable(symbolDurSec, sr);
+    const validBins = Object.keys(binToSymbol).map(Number).sort((a, b) => a - b);
+
+    const symN = baseUp.length;
+    const guardN = Math.round(symbolDurSec * C.GUARD_FRACTION * sr);
+    const syncGuardN = Math.round(symbolDurSec * C.SYNC_GUARD_FRACTION * sr);
+    const step = symN + guardN;
+
+    // Only search for the payload's sync chirp AFTER the header has ended
+    // (if a start point was given), so we can never mistake the header's
+    // own sync chirp for a payload sync.
+    const searchData = searchStartSample ? data.subarray(searchStartSample) : data;
+    const { positions: rawPositions, corr } = C.findSyncPositions(searchData, sr, baseDown, Math.max(symbolDurSec * 0.5, 0.01), 0.35);
+    const positions = searchStartSample ? rawPositions.map(p => p + searchStartSample) : rawPositions;
     if (positions.length === 0) {
       return { ok: false, reason: 'no-sync', positions, corr };
     }
@@ -531,53 +614,23 @@
 
       let result = null;
 
-      if (knownSettingsToggle.checked) {
-        const bps = parseInt(decBpsSlider.value, 10);
-        const eccPct = parseInt(decEccSlider.value, 10);
-        const repFactor = C.eccRepFactor(eccPct);
-        const useCrc = decCrcToggle.checked;
-        result = attemptDecode(data, sr, bps, repFactor, useCrc, null);
-        decProgressBar.style.width = '90%';
-      } else {
-        // Auto-detect: try a candidate set of bps values, pick the one
-        // with the strongest/most-consistent sync correlation, then try
-        // ECC factors 1-5x (favoring one that makes CRC validate, if used).
-        const candidates = [5, 1, 2, 10, 20, 50, 100, 150, 300];
-        let bestBps = null, bestScore = -1, bestPositions = null;
-        for (let ci = 0; ci < candidates.length; ci++) {
-          const bps = candidates[ci];
-          const symbolDurSec = C.bpsToSymbolDuration(bps);
-          const baseDown = C.makeRealDownChirp(symbolDurSec, sr);
-          const { positions, corr } = C.findSyncPositions(data, sr, baseDown, Math.max(symbolDurSec * 0.5, 0.01), 0.4);
-          if (positions.length >= 2) {
-            // score by peak correlation strength relative to median (rough SNR proxy)
-            let peak = 0, sum = 0;
-            for (const p of positions) peak = Math.max(peak, corr[p] || 0);
-            const sorted = Float64Array.from(corr).sort((a, b) => a - b);
-            const median = sorted[Math.floor(sorted.length / 2)] || 1;
-            const score = peak / Math.max(median, 1e-6);
-            if (score > bestScore) { bestScore = score; bestBps = bps; bestPositions = positions; }
-          }
-          decProgressBar.style.width = `${30 + Math.round(40 * (ci + 1) / candidates.length)}%`;
-          await new Promise(r => setTimeout(r, 0));
-        }
+      // Always decode the self-describing header first -- it's sent at a
+      // fixed, known 5bps regardless of the payload's own rate, so this
+      // never requires guessing anything about the transmission.
+      const headerResult = decodeHeader(data, sr);
+      decProgressBar.style.width = '55%';
+      await new Promise(r => setTimeout(r, 0));
 
-        if (bestBps == null) {
-          result = { ok: false, reason: 'no-sync' };
-        } else {
-          // try CRC-on first (most common default), rep factors 1..5
-          let found = null;
-          for (const useCrc of [true, false]) {
-            for (let rep = 1; rep <= 5; rep++) {
-              const attempt = attemptDecode(data, sr, bestBps, rep, useCrc, null);
-              if (attempt.ok && useCrc && attempt.crcOk) { found = attempt; break; }
-              if (attempt.ok && !useCrc && !found) found = attempt; // fallback candidate
-            }
-            if (found && found.crcOk) break;
-          }
-          result = found || { ok: false, reason: 'no-complete-repeats' };
+      if (!headerResult.ok) {
+        result = { ok: false, reason: headerResult.reason || 'no-header-sync', corr: headerResult.corr, positions: headerResult.positions };
+      } else {
+        const { bps, eccPercent, useCrc, repeats } = headerResult.header;
+        const repFactor = C.eccRepFactor(eccPercent);
+        result = attemptDecode(data, sr, bps, repFactor, useCrc, null, headerResult.headerEndSample);
+        if (result.ok) {
+          result.headerInfo = { bps, eccPercent, useCrc, repeats };
         }
-        decProgressBar.style.width = '95%';
+        decProgressBar.style.width = '90%';
       }
 
       showResult(result);
@@ -596,8 +649,11 @@
     if (!result.ok) {
       resultBox.classList.add('fail');
       let msg = 'Could not find a usable signal in this recording.';
-      if (result.reason === 'no-sync') msg = 'No sync chirp detected. The signal may be too weak, the recording too short, or the settings mismatched.';
-      if (result.reason === 'no-complete-repeats') msg = 'A sync chirp was found but no complete message repeat could be decoded (recording may be cut off).';
+      if (result.reason === 'no-header-sync') msg = 'No header sync chirp detected. The signal may be too weak, or the recording may not contain a transmission from this tool.';
+      if (result.reason === 'header-truncated') msg = 'A header sync chirp was found but the recording is cut off before the header finished — try a longer recording.';
+      if (result.reason === 'header-implausible') msg = 'A header-shaped sync was found but its contents don\u2019t look valid (likely noise, not a real transmission).';
+      if (result.reason === 'no-sync') msg = 'Header decoded, but no payload sync chirp was found afterward. The recording may be cut off right after the header.';
+      if (result.reason === 'no-complete-repeats') msg = 'Header decoded, but no complete payload repeat could be decoded (recording may be cut off).';
       if (result.reason === 'error') msg = 'Error reading this file: ' + result.error;
       resultText.textContent = msg;
       resultMeta.textContent = '';
@@ -607,6 +663,10 @@
     resultBox.classList.remove('fail');
     resultText.textContent = result.text || '(empty)';
     const bits = [];
+    if (result.headerInfo) {
+      const h = result.headerInfo;
+      bits.push(`detected: ${h.bps}bps, ${h.eccPercent}% ecc, crc ${h.useCrc ? 'on' : 'off'}, ${h.repeats}\u00d7`);
+    }
     bits.push(`${result.validRepeats}/${result.totalRepeats} repeat(s) used`);
     bits.push(`avg confidence ${result.avgConf.toFixed(1)} dB`);
     if (result.crcOk === true) bits.push('checksum OK ✓');

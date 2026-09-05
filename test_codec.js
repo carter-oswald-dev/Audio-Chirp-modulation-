@@ -209,4 +209,42 @@ function assert(cond, msg) {
   }
 }
 
+// ---- Test 9: header bit-packing round trip across the full parameter space ----
+{
+  const testCases = [
+    { bps: 5, eccPercent: 0, useCrc: false, repeats: 1 },
+    { bps: 300, eccPercent: 100, useCrc: true, repeats: 31 },
+    { bps: 1, eccPercent: 100, useCrc: true, repeats: 1 },
+    { bps: 150, eccPercent: 50, useCrc: false, repeats: 15 },
+    { bps: 250, eccPercent: 25, useCrc: true, repeats: 20 },
+  ];
+  let allOk = true;
+  for (const tc of testCases) {
+    const symbols = ChirpCodec.headerToSymbols(tc.bps, tc.eccPercent, tc.useCrc, tc.repeats);
+    if (symbols.length !== ChirpCodec.HEADER_SYMBOLS) {
+      console.log(`  header symbol count wrong: got ${symbols.length}, expected ${ChirpCodec.HEADER_SYMBOLS}`);
+      allOk = false;
+    }
+    const decoded = ChirpCodec.symbolsToHeader(symbols);
+    if (decoded.bps !== tc.bps || decoded.eccPercent !== tc.eccPercent ||
+        decoded.useCrc !== tc.useCrc || decoded.repeats !== tc.repeats) {
+      console.log(`  mismatch: sent ${JSON.stringify(tc)} got ${JSON.stringify(decoded)}`);
+      allOk = false;
+    }
+  }
+  assert(allOk, 'header bit-packing round trip across parameter space');
+}
+
+// ---- Test 10: isPlausibleHeader rejects out-of-range / garbage values ----
+{
+  assert(ChirpCodec.isPlausibleHeader({bps:5,eccPercent:0,useCrc:false,repeats:3}) === true,
+    'plausible header accepted');
+  assert(ChirpCodec.isPlausibleHeader({bps:0,eccPercent:0,useCrc:false,repeats:3}) === false,
+    'bps=0 rejected as implausible');
+  assert(ChirpCodec.isPlausibleHeader({bps:5,eccPercent:150,useCrc:false,repeats:3}) === false,
+    'eccPercent=150 rejected as implausible (exceeds 8-bit-packed but nonsensical >100 value)');
+  assert(ChirpCodec.isPlausibleHeader({bps:5,eccPercent:0,useCrc:false,repeats:0}) === false,
+    'repeats=0 rejected as implausible');
+}
+
 console.log('\nDone.');
